@@ -1,0 +1,1522 @@
+#!/usr/bin/perl
+
+# Author: Łukasz Milewski (lmilewski at gmail dot com)
+# Date: 16.10.2010
+
+use strict;
+use warnings;
+
+###################################################################### CONFIGURATION
+my $cfg = {
+    xterm_width => 40,             # width of one "pixel" on the screen
+    xterm_height => 60,            # height of one "pixel" on the screen
+    width => 15,                   # width of the board
+    height => 11,                  # height of the board
+    level_color => "red",          # color of the border
+    frame_delay_in_s => 0.1,       # how much delay between two frames there should be 
+    tcp_controller_port => 4321,   # on which port the players are supposed to connect
+    tcp_quit_command => "quit",    # what is the quit command of the tcp connection
+    apples_count => 5,             # how many apples should be on the screen at all times
+    apple_color => "yellow",       # what is the colour of "pixel" being an apple
+    snake_movement_speed => 1.25,  # how fast does the snake move (note: to low value can cause efficiency problems, as terminals appears/disappears not that quickly)
+};
+
+
+###################################################################### UTILS
+# Some stuff that proved to be usefull
+package Utils;
+
+use strict;
+use warnings;
+
+## L2 norm squared
+# pos1 = [x1, y1]
+# pos2 = [x2, y2]
+sub distance_euclid_squared {
+    my ($pos1, $pos2) = @_;
+    my $dx = $pos1->[0] - $pos1->[0];
+    my $dy = $pos1->[1] - $pos1->[1];
+    return $dx*$dx + $dy*$dy
+}
+
+## L2 norm
+# pos1 = [x1, y1]
+# pos2 = [x2, y2]
+sub distance_euclid {
+    my ($pos1, $pos2) = @_;
+    return sqrt(distance_euclid_squared($pos1, $pos2));
+}
+
+## Find out what is your IP address.
+# This needs ifconfig to work
+# This won't work if you have more than one interface or aliasses, as it will pick random IP then
+sub get_ip_address {
+    my $ifconfig="/sbin/ifconfig";
+    my @lines = qx| $ifconfig | or die "Can't get info from ifconfig: $!\n";
+    @lines = grep /inet addr/, @lines;
+    @lines = grep !/127.0.0.1/, @lines;
+    $lines[0] =~ m/inet addr:([\d.]+)/;
+    die "Can't get IP address from ifconfig info\n" unless $1;
+    my $ip = $1;
+    return $ip;
+}
+
+###################################################################### Algo
+## Package with usefull algorithms
+package Algo;
+
+use strict;
+use warnings;
+
+## Given a 2d grid with fields marked as "can NOT be here" or "can be
+## here" and starting position find what is the shortest path to each
+## field in the grid. When in field X then fields O are its neighbours
+##.........
+##....O....
+##...OXO...
+##....O....
+##.........
+##
+# $grid -> 2d array, undef/0 - can't move, other - can move
+# $source -> [$x, $y]
+sub compute_distances_in_grid {
+    my ($grid, $source) = @_;
+
+    my $queue = [ [$source->[0], $source->[1], 0]  ];
+    my $result;
+    my $visited;
+    $visited->[$source->[0]][$source->[1]] = 1;
+
+    while (@$queue) {
+        my $e = pop @$queue;
+        my ($x, $y, $d) = @$e; # pos_x, pos_y, distance from source
+        $result->[$x][$y] = $d;
+
+        if ($grid->[$x+1][$y] && !defined $result->[$x+1][$y] && !$visited->[$x+1][$y]) {
+            unshift @$queue, [$x+1, $y, $d+1];
+            $visited->[$x+1][$y] = 1;
+        }
+        if ($x > 0 && $grid->[$x-1][$y] && !defined $result->[$x-1][$y] && !$visited->[$x-1][$y]) {
+            unshift @$queue, [$x-1, $y, $d+1];
+            $visited->[$x-1][$y] = 1;
+        }
+        if ($grid->[$x][$y+1] && !defined $result->[$x][$y+1] && !$visited->[$x][$y+1]) {
+            unshift @$queue, [$x, $y+1, $d+1];
+            $visited->[$x][$y+1] = 1;
+        }
+        if ($y > 0 && $grid->[$x][$y-1] && !defined $result->[$x][$y-1] && !$visited->[$x][$y-1]) {
+            unshift @$queue, [$x, $y-1, $d+1];
+            $visited->[$x][$y-1] = 1;
+        }
+    }
+
+    return $result;
+}
+
+###################################################################### GRID
+## Grid used to dispaly colored cells. Uses xterms to do its job. You
+## can call it the rendering engine :-D
+##
+## Note that for efficiency reasons you only redisplay what has
+## changed (popping out xterms proved to be REALLY slow). This is not
+## normal in graphics libraries like OpenGL, when you usually
+## redisplay everything every frame.
+package Grid;
+use strict;
+use warnings;
+
+##########
+## Create new grid instance. Set all fields as empty.
+sub new {
+    my ($class, $xterm_width, $xterm_height, $width, $height) = @_;
+    my $self = {};
+    bless $self, $class;
+
+    $self->{xterm_width} = $xterm_width;
+    $self->{xterm_height} = $xterm_height;
+    $self->{width}  = $width;
+    $self->{height} = $height;
+    # $self->{grid}
+    # $self->{changed} # whether the field should be redisplayed
+    # $self->{pid}
+
+    my $grid = $self->{grid};
+    for (my $y = 0; $y < $self->height(); $y++) {
+        for (my $x = 0; $x < $self->width(); $x++) {
+            $self->set_color($x, $y, "none");
+        }
+    }
+
+    return $self;
+}
+
+##########
+## Set the color of the cell ($x, $y). $color can be set to one of
+##  none
+##  black
+##  red3
+##  green3
+##  yellow3
+##  dark blue
+##  magenta3
+##  cyan3
+##  gray90
+sub set_color {
+    my ($self, $x, $y, $color) = @_;
+    if ($x >= 0 && $x < $self->width() && $y >= 0 && $y < $self->height()) {
+        if ((!defined $self->{grid}[$x][$y]) or ($color ne $self->{grid}[$x][$y])) {
+            $self->{grid}[$x][$y] = $color;
+            $self->{changed}[$x][$y] = 1;
+        }
+    }
+}
+
+##########
+## Returns the color displayed in given position
+sub get_color {
+    my ($self, $x, $y) = @_;
+    return $self->{grid}[$x][$y];
+}
+
+##########
+## Show the board on the screen. Redisplay only fields that have changed 
+sub display {
+    my ($self) = @_;
+
+    for (my $y = 0; $y < $self->height(); $y++) {
+        for (my $x = 0; $x < $self->width(); $x++) {
+            if ($self->{changed}[$x][$y]) {
+                my $color = $self->{grid}[$x][$y];
+                $self->__set_xterm($x, $y, $color);
+                $self->{changed}[$x][$y] = 0;
+            }
+        }
+    }
+}
+
+##########
+## Sets the colored xterm in given position (if $color is 'none' then
+## the xterm is not created). Firstly it kills previous xterm in that
+## position. Then it creates new xterm if necessery
+sub __set_xterm {
+    my ($self, $x, $y, $color) = @_;
+
+    # kill current xterm
+    my $pid = $self->{pid}[$x][$y];
+    if (defined $pid) {
+        kill 9, $pid;
+        waitpid $pid, 0;
+        $self->{pid}[$x][$y] = undef;
+    }
+
+    # create new xterm
+    if ($color ne "none") {
+        my $pid = fork();
+        unless ($pid) {
+            my ($pos_x, $pos_y) = ($x*$self->{xterm_width}, $y*$self->{xterm_height});
+            exec "xterm", ("-T", "''", "-display", ":0", "-fg", "$color", "-bg", "$color", "-cr", "$color", "-geometry", "5x2+$pos_x+$pos_y");
+        }
+        $self->{pid}[$x][$y] = $pid;
+    }
+}
+
+##########
+## Returns width of the grid
+sub width {
+    my ($self) = @_;
+    return $self->{width};
+}
+
+##########
+## Returns height of the grid
+sub height {
+    my ($self) = @_;
+    return $self->{height};
+}
+
+##########
+## Sets all cells to 'none'
+sub clear {
+    my ($self) = @_;
+    for (my $y = 0; $y < $self->height(); $y++) {
+        for (my $x = 0; $x < $self->width(); $x++) {
+            $self->set_color($x, $y, "none");
+        }
+    }
+}
+
+##########
+## Clears the screen
+sub DESTROY {
+    my ($self) = @_;
+    $self->clear();
+    $self->display();
+}
+
+
+###################################################################### BOARD
+## The board on which the game is beeing played
+package Board;
+use warnings;
+use strict;
+
+sub new {
+    my ($class, $width, $height, $color) = @_;
+    my $self = {};
+    bless $self, $class;
+
+#   $self->{board};
+    $self->{width}  = $width;
+    $self->{height} = $height;
+    $self->{color} = $color || "red";
+
+    $self->__clear();
+
+    return $self;
+}
+
+# make all fields empty
+sub __clear {
+    my ($self) = @_;
+
+    for my $row ($self->{board}) {
+        for my $cell (@$row) {
+            $cell = 0;
+        }
+    }
+}
+
+##########
+## Makes the board look like rectangular frame (maximum that can be
+## displayed):
+##
+##  ooooooooo
+##  o       o
+##  o       o
+##  ooooooooo
+sub create_rect {
+    my ($self) = @_;
+
+    for (my $y = 0; $y < $self->height(); $y++) {
+        $self->{board}[0][$y] = 1;
+        $self->{board}[$self->width()-1][$y] = 1;
+    }
+
+    for (my $x = 0; $x < $self->width(); $x++) {
+        $self->{board}[$x][0] = 1;
+        $self->{board}[$x][$self->height()-1] = 1;
+    }
+}
+
+## read the board from the file. You should use 'X' for fields that
+## are inaccessible for snakes and some other chars for other fields
+## (I prefer '.' for empty fields)
+sub read_from_file {
+    my ($self, $fname) = @_;
+    $self->{board} = undef;
+    
+    open my $fd, "<", $fname 
+        or die "Can't read file: $!\n";
+
+    for (my $y = 0; $y < $self->height(); $y++) {
+        my $line = <$fd>;
+        die "incorrect number of lines in file $fname\n" unless defined $line;
+        for (my $x = 0; $x < $self->width(); $x++) {
+            my $char = substr($line, $x, 1);
+            if ($char eq "X") {
+                $self->{board}[$x][$y] = 1;
+            }
+        }
+    }
+}
+
+## Copy board fields positions to the display
+sub display {
+    my ($self, $display) = @_;
+    for (my $y = 0; $y < $self->height(); $y++) {
+        for (my $x = 0; $x < $self->width(); $x++) {
+            if ($self->get_xy($x, $y)) {
+                $display->set_color($x, $y, $self->{color});
+            }
+        }
+    }
+}
+
+# 1 if the fields is blocked, 0 otherwise
+sub get_xy {
+    my ($self, $x, $y) = @_;
+    return $self->{board}[$x][$y];
+}
+
+sub width {
+    my ($self) = @_;
+    return $self->{width};
+}
+
+sub height {
+    my ($self) = @_;
+    return $self->{height};
+}
+
+
+###################################################################### LEVEL
+## This is responsible for handling one game level. From start to the
+## death of all players. It manages all the objects (players
+## included): updating, displaying, collissions, placing apples
+package Level;
+
+use strict;
+use warnings;
+
+# $board - the board object that is used to play the game on.
+# $apples_count - how many apples should be on the board at every time in the game
+# $apple_color - what is the color of "pixels" representing apples
+sub new {
+    my ($class, $board, $apples_count, $apple_color) = @_;
+    my $self = {};
+    bless $self, $class;
+
+    # world
+    $self->{world}{board}        = $board;
+    $self->{world}{players}      = [];
+    $self->{world}{apples}       = [];
+
+    # other values
+    $self->{finished}     = 0;
+    $self->{apples_count} = $apples_count || 3;
+    $self->{apple_color}  = $apple_color  || "green";
+
+    $self->__add_apples_if_necessary();
+
+    return $self;
+}
+
+# returns hash comprising board, players and apples
+# {
+#    board   =>  Board,
+#    players => [Player,...],
+#    apples  => [[x,y],...]
+# }
+sub world {
+    my ($self) = @_;
+    return $self->{world};
+}
+
+# Iterate over all obejcts and display them
+sub display {
+    my ($self, $display) = @_;
+
+    $self->{world}{board}->display($display);
+
+    for my $player (@{$self->{world}{players}}) {
+        $player->display($display);
+    }
+
+    # TRICK: An apple can disappear only when it is eaten by a
+    # snake. Though we don't have to set display to none where there
+    # was an apple.
+    for my $apple (@{$self->{world}{apples}}) {
+        $display->set_color($apple->[0], $apple->[1], $self->{apple_color});
+    }
+}
+
+# Iterate over all object and display them
+# $dt - how many time lasted since this methat last beeing called
+sub update {
+    my ($self, $dt) = @_;
+
+    $self->__check_collisions();
+    $self->__add_apples_if_necessary();
+    for my $player (@{$self->{world}{players}}) {
+        $player->update($dt);
+    }
+}
+
+# 1 if all players are dead, 0 otherwise
+sub all_players_are_dead {
+    my ($self) = @_;
+    for my $player (@{ $self->{world}{players} }) {
+        return 0 unless $player->killed();
+    }
+    return 1;
+}
+
+# find all collisions in the game at the moment and react accordingly
+sub __check_collisions {
+    my ($self) = @_;
+
+    for my $player (@{ $self->{world}{players} }) {
+        unless ($player->killed()) {
+            $self->__check_collisions_for_player($player);
+        }
+    }
+}
+
+# Check collisions for one player and react accordingly
+sub __check_collisions_for_player {
+    my ($self, $player) = @_;
+
+    my @pos = $player->position();
+
+    # collision with the screen (can't go off the screen)
+    if ($pos[0] < 0 || $pos[1] < 0) {
+        $player->kill();
+    }
+    if ($pos[0] >= $self->{world}{board}->width() || $pos[1] >= $self->{world}{board}->height()) {
+        $player->kill();
+    }
+
+    # collisions with apples
+    for my $apple (@{ $self->{world}{apples} }) {
+        if ($apple->[0] == $pos[0] && $apple->[1] == $pos[1]) {
+            $player->add_points(1);
+            $player->increase_length(1);
+            @{$apple} = $self->__get_random_free_field();
+        }
+    }
+
+    # collision with self
+    my @body = @{ $player->body() };
+    shift @body if @body; # we check collisions for head - it should never collide with itself
+    for my $part (@body) {
+        if ($pos[0] == $part->[0] && $pos[1] == $part->[1]) {
+            $player->kill();
+        }
+    }
+
+    # collision with other players
+    for my $p (@{ $self->{world}{players} }) {
+        next if $p == $player;
+
+        my @pbody = @{ $p->body() };
+        my $phead = shift @pbody;
+
+        # check if it is head<->head collision (if so, thet both players die)
+        if ($phead->[0] == $pos[0] && $phead->[1] == $pos[1]) {
+            $p->kill();
+            $player->kill();
+        }
+
+        # check head<->body collision (only $player dies)
+        for my $part (@pbody) {
+            if ($pos[0] == $part->[0] && $pos[1] == $part->[1]) {
+                $player->kill();
+            }
+        }
+    }
+
+    # collision with the board
+    if ($self->{world}{board}->get_xy($pos[0], $pos[1])) {
+        $player->kill();
+    }
+}
+
+# helper function that returns coordinates [x,y] of a free field. If
+# it can't find any free field then returns [undef, undef] (NOTE: it
+# does not mean there is no free field. It only means that this
+# function was not able to find one)
+sub __get_random_free_field {
+    my ($self) = @_;
+    
+    my $width = $self->{world}{board}->width();
+    my $height = $self->{world}{board}->height();
+
+    my $repeat = 1000; # we don't want to be in infinite loop
+    my ($x, $y) = (undef, undef);
+    while ($repeat-- >  0) {
+        $x = int(rand() * $width);
+        $y = int(rand() * $height);
+        next if $self->__is_apple($x, $y);
+        next if $self->__is_board($x, $y);
+        next if $self->__is_snake($x, $y);
+        last;
+    } 
+
+    return ($x, $y);
+}
+
+# Keep number of apples high enough (at best equal to $self->{apples_count})
+sub __add_apples_if_necessary {
+    my ($self) = @_;
+    my $width = $self->{world}{board}->width();
+    my $height = $self->{world}{board}->height();
+
+    while (scalar @{$self->{world}{apples}} < $self->{apples_count}) {
+        my @random_apple_pos = $self->__get_random_free_field();
+        if (defined $random_apple_pos[0]) {
+            my ($apple_x, $apple_y) = @random_apple_pos;
+            push @{ $self->{world}{apples} }, [$apple_x, $apple_y];
+        }
+        else {
+            last;
+        }
+    }
+}
+
+# 1 if at given position there is a board field that can not be
+# taken be the snake.
+sub __is_board {
+    my ($self, $x, $y) = @_;
+    return $self->{world}{board}->get_xy($x, $y);
+}
+
+# 1 if given field is taken by a snake. 0 otherwise
+sub __is_snake {
+    my ($self, $x, $y) = @_;
+    for my $player (@{ $self->{world}{players} }) {
+        my $body = $player->body();
+        for my $cell (@$body) {
+            if ($cell->[0] == $x && $cell->[1] == $y) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+# 1 if given field is taken by an apple. 0 otherwise
+sub __is_apple {
+    my ($self, $x, $y) = @_;
+    for my $apple (@{ $self->{world}{apples} }) {
+        if ($x == $apple->[0] && $y == $apple->[1]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+sub __finish {
+    my ($self) = @_;
+    $self->{finished} = 1;
+}
+
+sub __finished {
+    my ($self) = @_;
+    return $self->{finished};
+}
+
+sub add_player {
+    my ($self, $player) = @_;
+    push @{$self->{world}{players}}, $player;
+}
+
+###################################################################### PLAYER
+package Player;
+
+use warnings;
+use strict;
+use Time::HiRes qw(gettimeofday);
+
+##########
+sub new {
+    my ($class, %params) = @_;
+    my $self = {};
+    bless $self, $class;
+    
+    # read parameters
+    my $pos = $params{position}                  || die "Unknown position for new player"; 
+    $self->{color}      = $params{color}         || die "Unknown color of the snake";
+    $self->__set_position($pos->[0], $pos->[1]); #     $self->{body};
+    $self->{direction}  = $params{direction}     || [0,0]; 
+    $self->{move_delay} = $params{move_delay}    || 1;
+    $self->{controller} = $params{controller}    || new PlayerControllerNull();
+    $self->{length}     = $params{length}        || 3;
+
+    # other fields
+    $self->{killed}           = 0;
+    $self->{score}            = 0;
+    $self->{need_redisplay}   = 1;
+    $self->{pos_update_delay} = $self->__move_delay(); # timer. if <= 0 then udpate should be run
+    $self->{playing}          = 0; # can move only if set to 1. 1 if there was a call to start_playing
+    # $self->{last_removed_x};
+    # $self->{last_removed_y};
+
+    return $self;
+}
+
+# this should be called when the game is ready and tha snake can start
+# moving
+sub start_playing {
+    my ($self) = @_;
+    $self->{playing} = 1;
+}
+
+# 1 if the snake is in the game, 0 otherwise
+sub playing {
+    my ($self) = @_;
+    return $self->{playing} && !$self->killed();
+}
+
+# Move the snake in its current direction. Do some logic or catch some
+# input to get new direction
+sub update {
+    my ($self, $dt) = @_;
+
+    return unless $self->playing();
+    $self->{pos_update_delay} -= $dt;
+    if ($self->{pos_update_delay} <= 0) {
+        $self->{pos_update_delay} += $self->__move_delay();
+
+        $self->__change_controller_if_available();
+        $self->__set_direction($self->{controller}->new_direction($self)); # some AI
+        $self->move_head();
+        $self->remove_tail();
+
+        $self->{need_redisplay} = 1;
+    }
+}
+
+# Mark the snake as killed. It can no longer move
+sub kill {
+    my ($self) = @_;
+    $self->{killed} = 1;
+    shift @{ $self->{body} }; # remove head, so the display is not doing strange things
+    print "SNAKE KILLED: ", $self->color(), "\n";
+}
+
+# Return 1 if the snake was already killed 
+sub killed {
+    my ($self) = @_;
+    return $self->{killed};
+}
+
+# If the controller tells you to change it to another one then do it
+# (this is something like really basic FSM)
+sub __change_controller_if_available {
+    my ($self) = @_;
+    my $controller = $self->{controller}->next_player_controller();
+    $self->{controller} = $controller if defined $controller;
+}
+
+# 
+sub display {
+    my ($self, $display) = @_;
+
+    if ($self->{need_redisplay}) {
+        if ($self->{last_removed_x}) {
+            $display->set_color($self->{last_removed_x}, $self->{last_removed_y}, "none");
+            $self->{last_removed_x} = undef;
+            $self->{last_removed_y} = undef;
+        }
+        my ($pos_x, $pos_y) = $self->position();
+        $display->set_color($pos_x, $pos_y, $self->color());
+    }
+}
+
+# remove oldest snake part
+sub remove_tail {
+    my ($self) = @_;
+
+    if (scalar @{$self->{body}} > $self->__length()) {
+        $self->{last_removed_x} = $self->{body}[-1][0]; # x
+        $self->{last_removed_y} = $self->{body}[-1][1]; # y
+        pop @{$self->{body}};
+    }
+}
+
+# adds new position to snake body at the front. This position is
+# current head position moved one field in current direction
+sub move_head {
+    my ($self) = @_;
+
+    my ($x, $y) = $self->position();
+    my ($dir_x, $dir_y) = $self->direction();
+    if ($dir_x != 0 || $dir_y != 0) {
+        my ($new_x, $new_y) = ($x + $dir_x, $y + $dir_y);
+        unshift @{ $self->{body} }, [$new_x, $new_y];
+    }
+}
+
+# add points for that player
+sub add_points {
+    my ($self, $points) = @_;
+    $points = 1 unless $points;
+    $self->{score} += $points;
+}
+
+# make the snake longer
+sub increase_length {
+    my ($self, $value) = @_;
+    $value = 1 unless $value;
+    $self->{length} += $value;
+}
+
+########## SOME ACCESSORS
+sub score {
+    my ($self) = @_;
+    return $self->{score};
+}
+
+sub body {
+    my ($self) = @_;
+    return $self->{body};
+}
+
+sub set_length {
+    my ($self, $length) = @_;
+    $self->{length} = $length;
+}
+
+sub set_controller {
+    my ($self, $controller) = @_;
+    $self->{controller} = $controller;
+}
+
+sub position {
+    my ($self) = @_;
+    return @{ $self->{body}[0] };
+}
+
+sub __set_position {
+    my ($self, $pos_x, $pos_y) = @_;
+    $self->{body}[0] = [$pos_x, $pos_y];
+}
+
+sub direction {
+    my ($self) = @_;
+    return @{ $self->{direction} };
+}
+
+sub __set_direction {
+    my ($self, $dir_x, $dir_y) = @_;
+    my ($cdx, $cdy) = $self->direction(); # we don't allow going directly backward
+    if ($cdx + $dir_x != 0 || $cdy + $dir_y != 0) {
+        $self->{direction} = [$dir_x, $dir_y];
+    }
+}
+
+sub color {
+    my ($self) = @_;
+    return $self->{color};
+}
+
+sub __move_delay {
+    my ($self) = @_;
+    return $self->{move_delay};
+}
+
+sub __length {
+    my ($self) = @_;
+    return $self->{length};
+}
+
+###################################################################### PLAYER CONTROLLER NULL
+## The controller that does no logic at all. It is used instead of
+## 'undef' value of the controller so we have no special case
+package PlayerControllerNull;
+use warnings;
+use strict;
+
+sub new {
+    my ($class) = @_;
+    my $self = {};
+    bless $self, $class;
+    return $self;
+}
+
+# returns new direction of the player. Null Controller never changes
+# the direction
+sub new_direction {
+    my ($self, $player) = @_;
+    return $player->direction();
+}
+
+# what controller should be used by the player as controller after
+# update. Null Controller never creates another controller
+sub next_player_controller {
+    return undef;
+}
+
+1;
+
+###################################################################### PlayerControllerTcp
+## Controller that uses tcp to compute next snake direction. Note that
+## you should also have TcpServer object if you want to use this class
+##
+## You probably want to use this controller for player controllable
+## snakes
+package PlayerControllerTcp;
+use warnings;
+use strict;
+
+# $name - name of the connection registered in TcpServer that will be used to poll data over TCP
+# $tcp_server - object responsible for all networking stuff
+# $key_mapping - four letters representing steerage. For example 'wsad' means
+#      w - up
+#      s - down
+#      a - left
+#      d - right
+sub new {
+    my ($class, $name, $tcp_server, $key_mapping) = @_;
+    my $self = {};
+    bless $self, $class;
+
+    $self->{name}          = $name;
+    $self->{server}        = $tcp_server;
+    $self->{key_mapping}   = $key_mapping || "wsad";
+    $self->{next_player_controller} = undef;
+
+    return $self;
+}
+
+# polls the server for new commands and returns corresponding new direction
+sub new_direction {
+    my ($self, $player) = @_;
+
+    my $server = $self->{server};
+    my $name   = $self->{name};
+    my $up    = substr($self->{key_mapping}, 0, 1);
+    my $down  = substr($self->{key_mapping}, 1, 1);
+    my $left  = substr($self->{key_mapping}, 2, 1);
+    my $right = substr($self->{key_mapping}, 3, 1);
+
+    my @messages = $server->get_messages_by_connection($name);
+    my @direction = $player->direction();
+    for my $msg (@messages) {
+        @direction = (0,-1) if $msg eq $up;
+        @direction = (0,1)  if $msg eq $down;
+        @direction = (-1,0) if $msg eq $left;
+        @direction = (1,0)  if $msg eq $right;
+    }
+
+    return @direction;
+}
+
+# This can be used to change the controlling of the snake i.e. if you
+# need a cutscene :-) I used it before to make the snake inactive (use
+# Null Controller) when the connection is closed by the player.
+sub __change_player_controller {
+    my ($self, $controller) = @_;
+    $self->{next_player_controller} = $controller;
+}
+
+sub next_player_controller {
+    my ($self) = @_;
+    return $self->{next_player_controller};
+}
+
+###################################################################### PlayerControllerSimpleAi
+
+## You probably want to use this controller to control cpu snake
+## movement. It uses a really basic strategy - go to the nearest
+## apple. If no such apple is available then go straight ahead
+package PlayerControllerSimpleAi;
+use warnings;
+use strict;
+
+sub new {
+    my ($class, $world) = @_;
+    my $self = {};
+    bless $self, $class;
+
+    $self->{world} = $world;
+
+    return $self;
+}
+
+sub new_direction {
+    my ($self, $player) = @_;
+
+    my $collision_grid = $self->__create_collision_grid();
+    my $head = $player->{body}[0];
+    my $distances = Algo::compute_distances_in_grid($collision_grid, $head);
+    my $path = $self->__find_path_to_nearest_apple($distances);
+
+    if (defined $path && scalar @$path > 1) {
+        my ($x0, $y0) = @{ shift @$path };
+        my ($x1, $y1) = @{ shift @$path };
+        return ($x1-$x0, $y1-$y0);
+    }
+    else {
+        return $player->direction();
+    }
+}
+
+# returns undef if no apples can be reached, otherwise find path to
+# that apple and return it
+#
+# $distances - distance grid computed for example by the Algo::compute_distances_in_grid
+sub __find_path_to_nearest_apple {
+    my ($self, $distances) = @_;
+    my $apple = $self->__find_nearest_apple($distances);
+    return undef unless defined $apple;
+    my $path = $self->__find_path_to_apple($apple, $distances);
+    return $path;
+}
+
+# find nearest apple and return path (list of pairs [x,y]) to that
+# apple
+#
+# $apple - our target
+# $distances - distances grid computed for example by the Algo::compute_distances_in_grid
+sub __find_path_to_apple {
+    my ($self, $apple, $distances) = @_;
+
+    my $path = [];
+    my ($x, $y) = ($apple->[0], $apple->[1]);
+    my $d = $distances->[$x][$y];
+
+    while ($d) {
+        unshift @$path, [$x,$y];
+        
+        my ($px, $py) = ($x, $y);
+        if (defined $distances->[$x+1][$y] && $distances->[$x+1][$y] < $d) {
+            $d = $distances->[$x+1][$y];
+            $px = $x + 1;
+        }
+        if (defined $distances->[$x-1][$y] && $distances->[$x-1][$y] < $d) {
+            $d = $distances->[$x-1][$y];
+            $px = $x - 1;
+        }
+        if (defined $distances->[$x][$y+1] && $distances->[$x][$y+1] < $d) {
+            $d = $distances->[$x][$y+1];
+            $py = $y + 1;
+        }
+        if (defined $distances->[$x][$y-1] && $distances->[$x][$y-1] < $d) {
+            $d = $distances->[$x][$y-1];
+            $py = $y - 1;
+        }
+        
+        ($x, $y) = ($px, $py);
+    }
+    unshift @$path, [$x,$y];
+    return $path;
+}
+
+# returns undef if there is no reachable apple
+# otherwise find nearest apple and find path to it
+sub __find_nearest_apple {
+    my ($self, $distances) = @_;
+
+    my $apples = $self->{world}{apples};
+    my $nearest_apple;
+    my $nearest_apple_distance;
+    for my $apple (@$apples) {
+        my $distance_to_apple = $distances->[$apple->[0]][$apple->[1]];
+
+        next unless defined $distance_to_apple; # skip apple if it is not reachable
+
+        # special case - $nearest_apple is not defined
+        if (!defined $nearest_apple) {
+            $nearest_apple = $apple;
+            $nearest_apple_distance = $distance_to_apple;
+            next;
+        }
+
+        # we know that $nearest_apple and $nearest_apple_distance are defined now
+        if ($distance_to_apple < $nearest_apple_distance) {
+            $nearest_apple_distance = $distance_to_apple;
+            $nearest_apple = $apple;
+        }
+    }
+
+#     print "NO NEAREST APPLE\n" unless defined $nearest_apple;
+    return $nearest_apple;    
+}
+
+# Creates grid needed by Algo::compute_distances_in_grid. Makes a map
+# of obstacles
+sub __create_collision_grid {
+    my ($self) = @_;
+
+    my $collision_grid;
+
+    # add empty fields in board as possible solutions
+    my $board  = $self->{world}{board};
+    for my $y (0..$board->height()-1) {
+        for my $x (0..$board->width()-1) {
+            unless ($board->get_xy($x, $y)) {
+                $collision_grid->[$x][$y] = 1;
+            }
+        }
+    }
+
+    # remove bodies of all snakes
+    my $players = $self->{world}{players};
+    for my $p (@$players) {
+        for my $segment (@{ $p->body() }) {
+            $collision_grid->[$segment->[0]][$segment->[1]] = undef;
+        }
+    }
+
+    return $collision_grid;
+}
+
+
+sub next_player_controller {
+    return undef;
+}
+
+###################################################################### PlayerControllerBox
+
+# This implements "dump" strategy. The snakes goes round the box. Used
+# mainly for testing purposes
+package PlayerControllerBox;
+use warnings;
+use strict;
+
+sub new {
+    my ($class, $board) = @_;
+    my $self = {};
+    bless $self, $class;
+    
+    $self->{board} = $board;
+
+    return $self;
+}
+
+sub new_direction {
+    my ($self, $player) = @_;
+    
+    my $width = $self->{board}->width();
+    my $height = $self->{board}->height();
+    my ($x, $y) = $player->position();
+
+    return (0,-1) if ($x == $width-2 && $y == $height-2); # bottom, right
+    return (-1,0) if ($x == $width-2 && $y == 1);         # top, right
+    return (0,1)  if ($x == 1 && $y == 1);                # top, left
+    return (1,0)  if ($x == 1 && $y == $height-2);        # bottom, left
+    return $player->direction();
+}
+
+sub next_player_controller {
+    return undef;
+}
+
+###################################################################### TCP Connection
+# Does the networking stuff. Read data from the connections and makes
+# it available to others modules
+#
+# This is part of the TcpServer
+package ConnectionTcp;
+use warnings;
+use strict;
+
+sub new {
+    my ($class, $socket) = @_;
+    my $self = {};
+    bless $self, $class;
+
+    $self->{messages} = [];
+    $self->{finished} = 0;
+    $self->{socket} = $socket;
+    $self->{buffer} = "";
+    $self->set_quit_cmd("quit");
+
+    $socket->blocking(0);
+
+    return $self;
+}
+
+sub set_quit_cmd {
+    my ($self, $cmd) = @_;
+    $self->{quit_command} = $cmd;
+}
+
+# Read commands from socket
+sub update {
+    my ($self, $dt) = @_;
+
+    return if $self->is_finished();
+
+    my $socket = $self->{socket};
+    while () {
+        my $data = <$socket>;
+        last unless defined $data;
+        $data =~ s/\r//mgs;
+        $self->{buffer} .= $data;
+        my @cmds = split /\n/, $self->{buffer};
+        push @{$self->{messages}}, @cmds;
+        $self->{buffer} =~ s/.*\n//mgs;
+
+        if ($self->__should_quit()) {
+            $self->finish();
+            $self->{messages} = [];
+            last;
+        }
+    }
+}
+
+sub __should_quit {
+    my ($self) = @_;
+    my $quit_msg = $self->{quit_command};
+    return scalar (grep /$quit_msg/, @{ $self->{messages} });
+}
+
+sub finish {
+    my ($self) = @_;
+    $self->{finished} = 1;
+}
+
+sub is_finished {
+    my ($self) = @_;
+    return $self->{finished};
+}
+
+# Returns all read messages and removes them from the queue.
+sub get_messages_and_clear {
+    my ($self) = @_;
+    my @messages = @{$self->{messages}}; # copy the list
+    $self->{messages} = [];
+    return @messages;
+}
+
+###################################################################### TCP Connection Factory
+# You should pass this object to the Tcp Server so that it knows how to create the Connection.
+# This is usefull if you want to pass some arguments to the Connection and not to the TcpServer
+package ConnectionFactoryTcp;
+use warnings;
+use strict;
+
+sub new {
+    my ($class) = @_;
+    my $self = {};
+    bless $self, $class;
+
+    return $self;
+}
+
+sub create {
+    my ($self, $socket) = @_;
+    return new ConnectionTcp($socket);
+}
+
+###################################################################### TCP Server
+# This is the server that accepts tcp connections and then delegates
+# all messaging to TcpConnection object.
+#
+# Note: you must update this object (call method update) in a main loop
+#
+# Note: all connections are named. The name is a string. You should
+# not have two connections with the same name unless you want to be in trouble
+package TcpServer;
+use warnings;
+use strict;
+use IO::Socket;
+
+sub new {
+    my ($class, $tcp_controller_port, $connection_factory) = @_;
+    my $self = {};
+    bless $self, $class;
+
+    $self->{ip} = $self->__ip();
+    $self->{tcp_controller_port} = $tcp_controller_port;
+    $self->{connection_factory} = $connection_factory;
+#   $self->{connections};
+#   $self->{acceptor};
+    $self->__start();
+
+    return $self;
+}
+
+sub __ip {
+    my ($self) = @_;
+    return Utils::get_ip_address();
+}
+
+sub __start {
+    my ($self) = @_;
+    my $acceptor = new IO::Socket::INET(
+        LocalHost => $self->{ip},
+        LocalPort => $self->{tcp_controller_port},
+        Proto => 'tcp',
+        Listen => 1,
+        Reuse => 1,
+        )
+        or die "Can not create TCP server: $!\n";
+
+    $self->{acceptor} = $acceptor;
+}
+
+sub __remove_finished_connections {
+    my ($self) = @_;
+
+    my $connections = $self->{connections};
+    my $new_connections = {};
+    for my $key (keys %$connections) {
+        my $connection = $connections->{$key};
+        unless ($connection->is_finished()) {
+            $new_connections->{$key} = $connections->{$key};
+        }
+    }
+    $self->{connections} = $new_connections;
+}
+
+sub is_connection_alive {
+    my ($self, $name) = @_;
+    return defined $self->{connections}{$name};
+}
+
+
+sub update {
+    my ($self, $dt) = @_;
+    $self->__update_connections($dt);
+    $self->__remove_finished_connections();
+}
+
+sub __update_connections {
+    my ($self, $dt) = @_;
+
+    for my $connection (values %{ $self->{connections} }) {
+        $connection->update($dt);
+    }
+}
+
+# does not use binmode
+# returns 0 if all is ok, 1 if the name is already taken
+sub wait_for_connection {
+    my ($self, $name) = @_;
+
+    return 1 if defined $self->{connections}{$name};
+
+    my $socket = $self->{acceptor}->accept()
+        or die "Can not accept connection: $!\n";
+    $socket->autoflush();
+    $self->{connections}{$name} = $self->{connection_factory}->create($socket);
+    return 0;
+}
+
+# Returns all messages from given connection (identified by the
+# $name).
+#
+# Note: returned messages will be removed from the Connection, so you
+# can treat it as a queue of commands.
+sub get_messages_by_connection {
+    my ($self, $name) = @_;
+
+    my $connection = $self->{connections}{$name};
+    return () unless defined $connection;
+
+    return $connection->get_messages_and_clear();
+}
+
+###################################################################### PlayerBoards
+# A board with scores for each player. It uses xterm to display the
+# status so, it is a bit slow (but of course, useing xterms is the
+# only thing that make this project fun) :-)
+package PlayerBoards;
+
+use warnings;
+use strict;
+
+sub new {
+    my ($class) = @_;
+    my $self = {};
+    bless $self, $class;
+
+    $self->{players}        = [];
+    $self->{displayed}      = {};
+
+    return $self;
+}
+
+# add player to the statistics
+sub add_player {
+    my ($self, $player) = @_;
+    push @{ $self->{players} }, $player;
+}
+
+# 1 if the player data has changed, 0 otherwise
+sub __need_redisplay {
+    my ($self, $player) = @_;
+    return !defined $self->{displayed}{$player}
+        || $self->{displayed}{$player}{score}  != $player->score()
+        || $self->{displayed}{$player}{killed} != $player->killed();
+}
+
+sub __update_display_info {
+    my ($self, $player) = @_;
+    $self->{displayed}{$player}{score} = $player->score();
+    $self->{displayed}{$player}{killed} = $player->killed();
+}
+
+# for every registered player if his display needs redisplaying then
+# kill old xterm and create new one
+sub display {
+    my ($self) = @_;
+
+    my $count = 0;
+    for my $player (@{ $self->{players} }) {
+        $count++;
+
+        next unless $self->__need_redisplay($player);
+        $self->__update_display_info($player);
+
+        $self->__hide($player);
+
+        my $pos_y = 60*($count-1);
+        my $msg = "Score: " . $player->score() . "\tAlive: " . (1 - $player->killed());
+
+        my $color = $player->color();
+        my $pid = fork();
+        unless ($pid) {
+            exec "xterm", ("-T", "Player: $color", 
+                           "-display", ":0",
+                           "-fg", "$color",
+                           "-cr", "$color", 
+                           "-bg", "black", 
+                           "-geometry", "50x1+1000+$pos_y", 
+                           "-e", "echo '$msg'; while true; do sleep 1; done");
+        }
+        $self->{pid}{$player} = $pid;
+    }
+}
+
+sub __hide {
+    my ($self, $player) = @_;
+    if ($self->{pid}{$player}) {
+        kill 9, $self->{pid}{$player};
+        $self->{pid}{$player} = undef;
+    }
+}
+
+
+sub DESTROY {
+    my ($self) = @_;
+    for my $player (@{ $self->{players} }) {
+        $self->__hide($player);
+    }
+}
+
+###################################################################### GAME
+# This module glue all other modules. It is also running the main loop
+package Game;
+
+use warnings;
+use strict;
+use Time::HiRes qw(gettimeofday usleep);
+
+sub new {
+    my ($class, $cfg, $player1_type, $player2_type) = @_;
+    my $self = {};
+    bless $self, $class;
+
+    $self->init($cfg, $player1_type, $player2_type);
+
+    return $self;
+}
+
+# create object graph (players, grids, displays, tcpservers, etc.)
+sub init {
+    my ($self, $cfg, $player1_type, $player2_type) = @_;
+
+    my $server = new TcpServer($cfg->{tcp_controller_port}, new ConnectionFactoryTcp($cfg));
+    my $board = new Board($cfg->{width}, $cfg->{height}, $cfg->{level_color});
+    $board->read_from_file("board.snk");
+    my $display = new Grid($cfg->{xterm_width}, $cfg->{xterm_height}, $cfg->{width}, $cfg->{height});
+    my $level = new Level($board, $cfg->{apples_count}, $cfg->{apple_color});
+
+    # create controllers for players
+    my $controller1;
+    if ($player1_type eq "cpu") {
+        $controller1 = new PlayerControllerSimpleAi($level->world()),
+    }
+    else { # player
+        print "Waiting for player 1 (green)\n";
+        $server->wait_for_connection("player1");
+        $controller1 = new PlayerControllerTcp("player1", $server, "wsad");
+        print "Player 1 (green) connected)\n";
+    }
+
+    my $controller2;
+    if ($player2_type eq "cpu") {
+        $controller2 = new PlayerControllerSimpleAi($level->world()),
+    }
+    else { # player
+        print "Waiting for player 2 (green)\n";
+        $server->wait_for_connection("player2");
+        $controller2 = new PlayerControllerTcp("player2", $server, "wsad");
+        print "Player 2 (green) connected)\n";
+    }
+
+    # create players
+    my $players = [
+        new Player(color => "green",
+                   position   => [4,5],
+                   controller => $controller1,
+                   move_delay => $cfg->{snake_movement_speed}),
+        new Player(color => "magenta",
+                   position   => [10,5],
+                   controller =>  $controller2,
+                   move_delay => $cfg->{snake_movement_speed}),
+        ];
+
+    # register players in the game
+    $level->add_player($_) for (@$players);
+    my $player_board = new PlayerBoards();
+    $player_board->add_player($_) for (@$players);
+
+    # store all game objects in private variables
+    $self->{server}  = $server;
+    $self->{board}   = $board;
+    $self->{display} = $display;
+    $self->{level}   = $level;
+    $self->{players} = $players;
+    $self->{player_board} = $player_board;
+}
+
+# display all objects
+sub display {
+    my ($self) = @_;
+    $self->{level}->display($self->{display});
+    $self->{player_board}->display();
+    $self->{display}->display();
+}
+
+# update all objects
+sub update {
+    my ($self, $dt) = @_;
+    $self->{server}->update($dt);
+    $self->{level}->update($dt);
+}
+
+# game main loop
+sub run {
+    my ($self) = @_;
+
+    $_->start_playing() for (@{ $self->{players} });
+
+    my $last = gettimeofday();
+    while () {
+        my $now = gettimeofday();
+        my $dt = $now-$last;
+        $last = $now;
+        
+        $self->update($dt);
+        last if $self->{level}->all_players_are_dead();
+        $self->display();
+
+        usleep($cfg->{frame_delay_in_s} * 1000 * 1000);
+    }
+}
+
+# you can call this to get the results (pairs "player's color", "player's score")
+sub get_results {
+    my ($self) = @_;
+    my $result = {};
+    for my $player (@{ $self->{players} }) {
+        $result->{$player->color()} = $player->score();
+    }
+    return $result;
+}
+
+###################################################################### MAIN
+package main;
+
+use warnings;
+use strict;
+
+my $player1_type = shift or die "player 1 (green) type not specified. Can be 'cpu' or 'human'\n";
+my $player2_type = shift or die "player 2 (magenta) type not specified. Can be 'cpu' or 'human'\n";
+
+my $game = new Game($cfg, $player1_type, $player2_type);
+$game->display();
+my $data = <stdin>; # let user decide when to start the game
+$game->run();
+
+# print summary
+print "Game over!\n";
+my %results = %{ $game->get_results() };
+while (my ($color, $score) = each(%results)) {
+    print "Player: ", $color, ": ", $score, "\n";
+}
