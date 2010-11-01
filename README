@@ -1,0 +1,12 @@
+Uruchomienie gry:
+ $ ./xterm_snake P1 P2
+Gdzie P1,P2 to albo cpu albo human.
+
+Na każde wybrane human musi przypadać jedno połączenie TCP na port 4321.
+
+Sterowanie gracza:
+ Należy połączyć się przez telnet na porcie 4321. Następnie można wydawać komendy w,s,a,d (góra, dół, lewo, prawo). Każdą komendę należy potwierdzi enterem.
+
+Snake nie może wejść ani w przeciwnika ani w ścianę. Wygrywa ten, który nazbiera więcej jabłek.
+
+ENJOY
